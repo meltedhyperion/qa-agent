@@ -13,6 +13,9 @@
 | FR-1.5 | System shall handle various table formats — merged cells, nested tables, multi-paragraph cells, numbered lists within cells | Must |
 | FR-1.6 | System shall display parsed sections and test case counts for user to select | Must |
 | FR-1.7 | User shall be able to select which sections to run tests from | Must |
+| FR-1.8 | System shall use LLM to intelligently extract test cases from any document format (tables, paragraphs, numbered lists, mixed formats) | Must |
+| FR-1.9 | User shall be able to provide parsing hints to guide the LLM on where to find test cases in the document | Should |
+| FR-1.10 | System shall handle documents with non-test content (business context, requirements, architecture descriptions) by filtering to only test cases | Must |
 
 ### 1.2 Configuration
 
@@ -25,6 +28,11 @@
 | FR-2.5 | User shall be able to configure a filesystem folder for file uploads needed during tests | Must |
 | FR-2.6 | User shall be able to provide a system prompt to customize agent behavior | Should |
 | FR-2.7 | Agent shall flexibly parse YAML config based on test requirements (no rigid schema required) | Must |
+| FR-2.8 | System shall support LLM-powered config parsing for non-standard YAML formats | Must |
+| FR-2.9 | System shall auto-detect standard `global/tests` YAML format and use rigid parser (saving an LLM call) | Should |
+| FR-2.10 | User shall be able to select which browsers to run tests in (chromium, firefox, webkit, chrome, msedge) | Must |
+| FR-2.11 | User shall be able to add custom/enterprise browsers by providing a name and executable path | Should |
+| FR-2.12 | System shall validate browser availability before test execution via pre-flight checks | Must |
 
 ### 1.3 Test Review (Pre-Execution)
 
@@ -35,6 +43,8 @@
 | FR-3.3 | Cards shall be displayed in a scrollable view | Must |
 | FR-3.4 | User shall confirm/approve the test plan before execution begins | Must |
 | FR-3.5 | User shall be able to deselect individual test cases before running | Should |
+| FR-3.6 | User shall be able to upload test files through the UI for use during test execution | Should |
+| FR-3.7 | User shall be able to check browser availability from the review page | Should |
 
 ### 1.4 Test Execution
 
@@ -51,6 +61,9 @@
 | FR-4.9 | System shall record video of the entire browser session per test case | Must |
 | FR-4.10 | System shall handle page crashes and timeouts by reloading | Must |
 | FR-4.11 | User shall be able to trigger test execution via a "Run" button | Must |
+| FR-4.12 | System shall run each test case across all selected browsers (standard + custom) | Must |
+| FR-4.13 | System shall skip tests for browsers that fail pre-flight availability checks | Must |
+| FR-4.14 | Custom browsers shall be launched using Playwright's executable_path parameter | Must |
 
 ### 1.5 Session & Export Management
 
@@ -74,6 +87,9 @@
 | FR-6.2 | UI shall show which step/action the agent is currently executing | Should |
 | FR-6.3 | UI shall show the latest screenshot for each running test | Should |
 | FR-6.4 | UI shall provide summary counts: running, passed, failed, queued | Must |
+| FR-6.5 | UI shall show real-time trajectory log per test case with action details | Must |
+| FR-6.6 | Trajectory entries shall show action name, detail, status, and timestamp | Must |
+| FR-6.7 | "Executing" trajectory entries shall be replaced with final "passed"/"failed" status | Should |
 
 ---
 
@@ -114,11 +130,20 @@
 | NFR-14 | Test case cards shall clearly show all configuration the agent will use |
 | NFR-15 | Results report shall be human-readable without specialized tools (standard .docx viewer) |
 
+### 2.5 Cross-Platform
+
+| ID | Requirement |
+|----|------------|
+| NFR-16 | System shall support macOS, Windows, and Linux |
+| NFR-17 | Browser detection shall use platform-specific paths (Applications on macOS, PROGRAMFILES on Windows, /usr/bin on Linux) |
+
 ---
 
 ## 3. YAML Configuration Schema
 
 The YAML config file is intentionally flexible — the agent parses it based on test requirements. However, here is the recommended structure:
+
+> **Note:** Non-standard YAML formats are also accepted. The LLM will intelligently map any YAML structure to the required format. Only the standard `global/tests` format shown below triggers the rigid parser; all other formats go through LLM parsing.
 
 ```yaml
 # Global configuration applied to all tests
@@ -157,21 +182,25 @@ tests:
 
 ```
 exports/
-  session_<timestamp>/
-    test_case_1/
-      recording/              # Video file of the test run
-        recording.webm
+  <session_id>/
+    TC-001_chromium/
       screenshots/            # Screenshot per action, numbered sequentially
         001_navigate_login.png
         002_type_username.png
         003_type_password.png
         004_click_login.png
         005_verify_dashboard.png
+      recording/              # Video file of the test run
+        recording.webm
       downloads/              # Any files downloaded during the test
         report_Q1.pdf
-    test_case_2/
-      recording/
+    TC-001_firefox/
       screenshots/
+      recording/
+      downloads/
+    TC-002_chromium/
+      screenshots/
+      recording/
       downloads/
     ...
     results_report.docx       # Final formatted results document

@@ -5,38 +5,52 @@
 ### Phase 1: Upload and Parse
 
 ```
-User uploads .docx + YAML config
+User uploads .docx + optional YAML config
         |
         v
 POST /api/upload/document  -->  Save to /uploads/<session_id>/
 POST /api/upload/config     -->  Save to /uploads/<session_id>/
         |
         v
-POST /api/sessions/<id>/parse
+POST /api/sessions/<id>/parse  (JSON body: { parsing_hint?, model? })
         |
         v
-Backend spawns Document MCP Server (stdio)
+Two parsing paths:
         |
-        v
-Calls tool: parse_document(file_path)
+        +--> [Primary] LLM Parser (core/llm_parser.py)
+        |       Extracts raw text/tables from .docx
+        |       Sends to LLM with optional parsing_hint
+        |       Returns structured ParsedDocument
+        |
+        +--> [Legacy] Document MCP Server (mcp_servers/document/)
+                Still used for report generation
+                No longer primary parser for test case extraction
         |
         v
 Returns structured data:
 {
+  "filename": "test_plan.docx",
+  "document_title": "Progressive Test Suite",
+  "total_sections": 2,
+  "total_test_cases": 5,
   "sections": [
     {
       "name": "Progressive Tests",
+      "heading_level": 1,
       "test_cases": [
         {
           "id": "TC-001",
           "title": "Login with valid credentials",
+          "description": "Verify user can log in",
           "steps": [
             "Navigate to login page",
             "Enter username",
             "Enter password",
             "Click login button",
             "Verify dashboard is displayed"
-          ]
+          ],
+          "expected_result": "Dashboard is displayed",
+          "raw_text": ""
         }
       ]
     }
@@ -44,12 +58,18 @@ Returns structured data:
 }
 ```
 
+Config parsing also has an LLM path: the parser detects whether a YAML file follows the standard `global/tests` format and uses the rigid parser (`core/config_parser.py`). If the format is non-standard, it sends the YAML content to the LLM for intelligent mapping.
+
 ### Phase 2: Review and Configure
 
 ```
 Frontend displays parsed test cases as cards
         |
 User selects sections, adjusts execution mode, edits system prompt
+User selects browsers (standard + custom browsers with executable paths)
+User uploads test files the agent may need
+        |
+POST /api/sessions/check-browsers  -->  Pre-flight browser availability check
         |
 POST /api/sessions/<id>/configure
 {
@@ -58,7 +78,11 @@ POST /api/sessions/<id>/configure
   "execution_mode": "parallel",
   "concurrency": 3,
   "system_prompt": "...",
-  "upload_folder": "/path/to/test-files"
+  "upload_folder": "/path/to/test-files",
+  "browsers": ["chromium", "firefox"],
+  "custom_browsers": [
+    { "name": "Chrome Beta", "executable_path": "/usr/bin/chrome-beta" }
+  ]
 }
 ```
 
@@ -67,9 +91,12 @@ POST /api/sessions/<id>/configure
 ```
 POST /api/sessions/<id>/run
         |
-Backend creates execution plan
+Backend creates execution plan with BrowserRun concept
+(each test case runs across all selected browsers)
         |
-For each test case (parallel or sequential):
+Pre-flight browser check skips unavailable browsers with clear messages
+        |
+For each test case x browser combination (parallel or sequential):
   1. Spawn dedicated Playwright MCP Server instance
   2. Initialize AI Agent with system prompt + test context + MCP tools
   3. Agent loop:
@@ -79,7 +106,9 @@ For each test case (parallel or sequential):
      d. Screenshot captured after action
      e. LLM observes result (accessibility snapshot + screenshot path)
      f. LLM decides next action or confirms step complete
-     g. Status update sent via WebSocket
+     g. _broadcast_step() sends typed WebSocket messages for real-time trajectory
+        - step_update messages include action name, detail, and status
+        - LLM reasoning text captured as "thinking" entries
      h. Repeat until all steps done or failure after retries
   4. Collect artifacts (screenshots, video, downloads)
 ```
@@ -104,7 +133,7 @@ GET /api/sessions/<id>/report  -->  Download .docx
 ### 2a. Document MCP Server
 
 **Transport**: stdio
-**Lifecycle**: Spawned per session, lives for duration of parse + report generation phases.
+**Lifecycle**: Spawned per session. Primarily used for report generation; test case parsing is now handled by the LLM parser.
 
 #### Tools
 
@@ -262,11 +291,15 @@ async def execute_test_case(test_case, config, session, status_callback):
                         status="executed",
                     ))
 
+                # _broadcast_step() sends typed WebSocket messages
                 await status_callback({
+                    "type": "step_update",
                     "test_id": test_case.id,
                     "action": tool_call.function.name,
-                    "status": "executed",
+                    "detail": str(tool_call.function.arguments),
+                    "status": "executing",
                     "step_index": len(step_results),
+                    "error": None,
                 })
 
                 tool_result_content = build_tool_result_content(
@@ -280,6 +313,7 @@ async def execute_test_case(test_case, config, session, status_callback):
                 })
 
         elif choice.finish_reason == "stop":
+            # LLM reasoning text is also captured as "thinking" entries
             final_text = choice.message.content
             return TestResult(
                 test_case=test_case,
@@ -326,7 +360,7 @@ Long test cases with many screenshots could exhaust the context window:
 
 **Level 2: Page-level recovery (within the agent)**
 - Page crash, unresponsive, error page
-- Agent calls `reload()` → `navigate()` back to last URL → `close_browser()` + `launch_browser()` for fresh context
+- Agent calls `reload()` -> `navigate()` back to last URL -> `close_browser()` + `launch_browser()` for fresh context
 - Max 3 page-level recoveries per test case
 
 **Level 3: Test-case-level retry (orchestrator)**
@@ -345,6 +379,7 @@ Long test cases with many screenshots could exhaust the context window:
 | MCP server crash | Stdio pipe broken | Orchestrator restarts, resumes from last step |
 | Token limit exceeded | `max_tokens` reached | Split remaining steps into continuation |
 | Test step ambiguity | Agent can't determine action | Agent marks step as SKIPPED with explanation |
+| Browser unavailable | Pre-flight check fails | Orchestrator skips browser with clear message |
 
 ---
 
@@ -355,22 +390,24 @@ async def run_session(session: Session):
     semaphore = asyncio.Semaphore(session.config.concurrency)
     tasks = []
 
+    # BrowserRun: each test runs across all selected browsers
     for test_case in session.selected_test_cases:
-        task = asyncio.create_task(
-            run_with_semaphore(semaphore, test_case, session)
-        )
-        tasks.append(task)
+        for browser in session.config.browsers:
+            task = asyncio.create_task(
+                run_with_semaphore(semaphore, test_case, browser, session)
+            )
+            tasks.append(task)
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     return results
 
-async def run_with_semaphore(semaphore, test_case, session):
+async def run_with_semaphore(semaphore, test_case, browser, session):
     async with semaphore:
-        # Each test case gets its own:
+        # Each test case + browser combination gets its own:
         # 1. Playwright MCP Server process (new browser context)
         # 2. Agent conversation (fresh message history)
         # 3. Output subfolder
-        async with PlaywrightMCPServer() as pw_server:
+        async with PlaywrightMCPServer(browser=browser) as pw_server:
             result = await execute_test_case(
                 test_case=test_case,
                 config=session.config,
@@ -398,7 +435,7 @@ async def run_with_semaphore(semaphore, test_case, session):
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/api/upload/document` | Upload test .docx → returns `{ session_id, filename }` |
+| `POST` | `/api/upload/document` | Upload test .docx -> returns `{ session_id, filename }` |
 | `POST` | `/api/upload/config/{session_id}` | Upload YAML config |
 | `POST` | `/api/upload/files/{session_id}` | Upload test files for browser uploads |
 
@@ -408,8 +445,9 @@ async def run_with_semaphore(semaphore, test_case, session):
 |--------|------|-------------|
 | `GET` | `/api/sessions` | List all sessions |
 | `GET` | `/api/sessions/{id}` | Get session details |
-| `POST` | `/api/sessions/{id}/parse` | Parse uploaded document |
+| `POST` | `/api/sessions/{id}/parse` | Parse uploaded document (accepts `{ parsing_hint?, model? }`) |
 | `POST` | `/api/sessions/{id}/configure` | Set execution configuration |
+| `POST` | `/api/sessions/check-browsers` | Check browser availability |
 | `DELETE` | `/api/sessions/{id}` | Delete session and artifacts |
 
 #### Execution
@@ -427,11 +465,14 @@ async def run_with_semaphore(semaphore, test_case, session):
 | `GET` | `/api/sessions/{id}/report` | Download results .docx |
 | `GET` | `/api/sessions/{id}/export` | Download full session ZIP |
 | `GET` | `/api/sessions/{id}/screenshots/{test_id}` | Get screenshots for a test case |
+| `GET` | `/api/sessions/{id}/screenshot-file/{test_id}/{filename}` | Get individual screenshot file |
 | `GET` | `/api/sessions/{id}/video/{test_id}` | Stream test recording video |
 
 ### WebSocket Protocol
 
 **Endpoint**: `ws://localhost:8000/ws/sessions/{session_id}`
+
+All messages include a `type` field.
 
 #### Message Types
 
@@ -463,16 +504,20 @@ async def run_with_semaphore(semaphore, test_case, session):
   action_detail: string,
   status: "executing" | "passed" | "failed",
   screenshot_url: string | null,
+  error: string | null,
   timestamp: string
 }
 
 // Agent reasoning (optional debug)
 { type: "agent_thought", test_id: string, thought: string }
 
-// Execution complete
+// Execution complete (flat structure, not nested summary)
 {
   type: "execution_complete",
-  summary: { total: number, passed: number, failed: number, skipped: number },
+  total: number,
+  passed: number,
+  failed: number,
+  skipped: number,
   report_url: string,
   timestamp: string
 }
@@ -483,45 +528,69 @@ async def run_with_semaphore(semaphore, test_case, session):
 ## 7. Data Models
 
 ```python
-class TestCase(BaseModel):
+class ParsedTestCase(BaseModel):
     id: str
     title: str
-    steps: list[str]
-    section: str
-    config_overrides: dict[str, Any] | None = None
+    description: str | None = ""
+    steps: list[str] = Field(default_factory=list)
+    expected_result: str | None = ""
+    raw_text: str = ""
+
+class ParsedSection(BaseModel):
+    name: str
+    heading_level: int = 1
+    test_cases: list[ParsedTestCase] = Field(default_factory=list)
+
+class ParsedDocument(BaseModel):
+    filename: str
+    sections: list[ParsedSection] = Field(default_factory=list)
+    total_sections: int = 0
+    total_test_cases: int = 0
+    document_title: str = ""
 
 class TestConfig(BaseModel):
-    app_url: str
-    credentials: dict[str, str]
-    test_specific: dict[str, Any]
+    app_url: str = ""
+    credentials: dict[str, str] = Field(default_factory=dict)
+    timeout_ms: int = 30000
+    model: str = "gpt-4o"
+    extra: dict[str, Any] = Field(default_factory=dict)
+    test_specific: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+class CustomBrowser(BaseModel):
+    name: str
+    executable_path: str
 
 class ExecutionConfig(BaseModel):
-    selected_sections: list[str]
-    selected_test_ids: list[str]
-    execution_mode: Literal["parallel", "sequential"]
+    selected_sections: list[str] = Field(default_factory=list)
+    selected_test_ids: list[str] = Field(default_factory=list)
+    execution_mode: Literal["parallel", "sequential"] = "sequential"
     concurrency: int = 3
-    model: str = "gpt-4o"             # Any LiteLLM-supported model identifier
+    model: str = "gpt-4o"
     system_prompt: str = ""
     upload_folder: str | None = None
     max_retries: int = 0
+    browsers: list[str] = Field(default_factory=lambda: ["chromium"])
+    custom_browsers: list[CustomBrowser] = Field(default_factory=list)
 
 class StepResult(BaseModel):
     step_index: int
-    step_description: str
-    action: str
-    status: Literal["passed", "failed", "skipped"]
-    screenshot_path: str | None
-    error: str | None
-    duration_ms: int
+    step_description: str = ""
+    action: str = ""
+    status: Literal["passed", "failed", "skipped"] = "passed"
+    screenshot_path: str | None = None
+    error: str | None = None
+    duration_ms: int = 0
 
 class TestResult(BaseModel):
-    test_case: TestCase
-    status: Literal["passed", "failed", "skipped", "error"]
-    steps: list[StepResult]
-    summary: str
-    duration_ms: int
-    video_path: str | None
+    test_id: str
+    test_title: str
+    status: Literal["passed", "failed", "skipped", "error"] = "passed"
+    steps: list[StepResult] = Field(default_factory=list)
+    summary: str = ""
+    duration_ms: int = 0
+    video_path: str | None = None
     retry_count: int = 0
+    browser: str = "chromium"
 
 class SessionState(str, Enum):
     CREATED = "created"
@@ -541,40 +610,23 @@ class SessionState(str, Enum):
 ```
 qa-agent/
 ├── frontend/                          # Next.js application
-│   ├── app/
-│   │   ├── layout.tsx
-│   │   ├── page.tsx                   # Landing / upload page
-│   │   └── sessions/
-│   │       └── [id]/
-│   │           ├── review/page.tsx    # Review parsed test cases
-│   │           ├── execute/page.tsx   # Live execution monitoring
-│   │           └── results/page.tsx   # Results and export
-│   ├── components/
-│   │   ├── upload/
-│   │   │   ├── DocumentUploader.tsx
-│   │   │   ├── ConfigUploader.tsx
-│   │   │   └── FolderSelector.tsx
-│   │   ├── review/
-│   │   │   ├── TestCaseCard.tsx
-│   │   │   ├── SectionSelector.tsx
-│   │   │   ├── ExecutionConfig.tsx
-│   │   │   └── SystemPromptEditor.tsx
-│   │   ├── execution/
-│   │   │   ├── ExecutionDashboard.tsx
-│   │   │   ├── TestCaseProgress.tsx
-│   │   │   ├── LiveScreenshot.tsx
-│   │   │   └── StatusTimeline.tsx
-│   │   ├── results/
-│   │   │   ├── ResultsSummary.tsx
-│   │   │   ├── TestCaseResult.tsx
-│   │   │   └── ExportControls.tsx
-│   │   └── ui/                        # shadcn/ui components
-│   ├── lib/
-│   │   ├── api.ts                     # Backend API client
-│   │   ├── websocket.ts              # WebSocket connection manager
-│   │   └── types.ts                  # Shared TypeScript types
+│   ├── src/
+│   │   ├── app/
+│   │   │   ├── layout.tsx
+│   │   │   ├── page.tsx               # Upload page with parsing hints
+│   │   │   └── sessions/
+│   │   │       └── [id]/
+│   │   │           ├── review/page.tsx    # Review, configure, browser selection
+│   │   │           ├── execute/page.tsx   # Live execution with trajectory logs
+│   │   │           └── results/page.tsx   # Results and export
+│   │   ├── components/ui/             # shadcn/ui components
+│   │   └── lib/
+│   │       ├── api.ts                 # Backend API client
+│   │       ├── store.ts              # Zustand store with trajectory tracking
+│   │       ├── types.ts              # TypeScript interfaces
+│   │       ├── utils.ts              # Utility functions
+│   │       └── websocket.ts          # WebSocket hook
 │   ├── package.json
-│   ├── tailwind.config.ts
 │   └── tsconfig.json
 │
 ├── backend/                           # FastAPI application
@@ -582,20 +634,21 @@ qa-agent/
 │   ├── config.py                      # App configuration
 │   ├── api/
 │   │   ├── routes/
-│   │   │   ├── upload.py
-│   │   │   ├── sessions.py
-│   │   │   ├── execution.py
-│   │   │   └── export.py
-│   │   ├── websocket.py
-│   │   └── dependencies.py
+│   │   │   ├── upload.py              # Document, config, and test file uploads
+│   │   │   ├── sessions.py           # Session CRUD, parse, configure, browser check
+│   │   │   ├── execution.py          # Run, status, abort
+│   │   │   └── export.py             # Report, ZIP, screenshots, video
+│   │   └── websocket.py              # WebSocket hub
 │   ├── core/
-│   │   ├── session.py                 # Session model and state machine
-│   │   ├── orchestrator.py            # Test execution orchestrator
-│   │   ├── agent.py                   # AI agent loop
+│   │   ├── agent.py                   # AI agent loop with trajectory broadcasting
+│   │   ├── orchestrator.py            # Multi-browser execution orchestrator
+│   │   ├── session.py                 # In-memory session store
 │   │   ├── prompt_builder.py          # System prompt construction
-│   │   ├── config_parser.py           # YAML config loading
+│   │   ├── config_parser.py           # Rigid YAML config parser
+│   │   ├── llm_parser.py             # LLM-powered document and config parsing
+│   │   ├── browser_check.py          # Pre-flight browser availability checks
 │   │   ├── mcp_client.py             # MCP stdio client wrapper
-│   │   └── models.py                  # Pydantic models
+│   │   └── models.py                  # Pydantic models + WebSocket message types
 │   ├── mcp_servers/
 │   │   ├── document/
 │   │   │   ├── server.py              # Document MCP server (FastMCP)
@@ -603,51 +656,18 @@ qa-agent/
 │   │   │   └── report_generator.py    # .docx report creation
 │   │   └── playwright_browser/
 │   │       ├── server.py              # Playwright MCP server (FastMCP)
-│   │       ├── browser_manager.py     # Browser lifecycle
-│   │       ├── actions.py             # Browser action implementations
-│   │       └── screenshot.py          # Screenshot management
-│   ├── requirements.txt
+│   │       └── browser_manager.py     # Browser lifecycle + state management
 │   └── pyproject.toml
 │
-├── exports/                           # Runtime output (gitignored)
-├── uploads/                           # Runtime uploads (gitignored)
 ├── tests/
-│   ├── unit/
-│   ├── integration/
 │   └── fixtures/
 │       ├── sample_test_doc.docx
+│       ├── sample_test_doc_paragraph_steps.docx
+│       ├── sample_test_doc_unstructured.docx
 │       └── sample_config.yaml
-├── docker-compose.yml
+├── exports/                           # Runtime output (gitignored)
+├── uploads/                           # Runtime uploads (gitignored)
+├── docs/                              # Documentation
 ├── .env.example
 └── .gitignore
 ```
-
----
-
-## 9. Implementation Phases
-
-### Phase 1: Foundation (Week 1-2)
-1. Project structure setup (monorepo with `frontend/` and `backend/`)
-2. Document MCP Server: parse .docx, extract sections and test cases
-3. Backend API: file upload, session creation, parse endpoint
-4. Basic frontend: upload page, review page showing parsed test cases
-
-### Phase 2: Execution Core (Week 3-4)
-5. Playwright MCP Server: browser launch, navigate, click, type, screenshot
-6. AI Agent loop: system prompt construction, tool routing, message management
-7. Orchestrator: sequential execution of a single test case end-to-end
-8. WebSocket integration: live status streaming
-
-### Phase 3: Parallel & Polish (Week 5-6)
-9. Parallel execution with semaphore-based concurrency
-10. Retry logic at all three levels
-11. Report generation (Document MCP: generate results .docx)
-12. Export system (ZIP download of full session folder)
-13. Frontend execution monitoring dashboard and results view
-
-### Phase 4: Hardening (Week 7-8)
-14. Context window management (truncation, summarization)
-15. Error handling for all edge cases
-16. Video recording integration
-17. File upload/download support in Playwright MCP
-18. End-to-end testing of the complete pipeline
