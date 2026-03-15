@@ -1,0 +1,30 @@
+# Sample configuration for SauceDemo test suite
+# Companion file to sample_test_doc.docx
+
+global:
+  app_url: "https://www.saucedemo.com"
+  credentials:
+    username: "standard_user"
+    password: "secret_sauce"
+  timeout_ms: 30000
+  model: "gpt-4o"
+
+tests:
+  TC-002:
+    # Invalid login test uses wrong credentials on purpose
+    credentials:
+      username: "invalid_user"
+      password: "wrong_password"
+
+  TC-003:
+    # Locked out user test
+    credentials:
+      username: "locked_out_user"
+      password: "secret_sauce"
+
+  TC-009:
+    # Checkout test needs form inputs
+    inputs:
+      first_name: "Test"
+      last_name: "User"
+      postal_code: "12345"

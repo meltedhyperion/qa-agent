@@ -1,0 +1,31 @@
+[project]
+name = "qa-agent-backend"
+version = "0.1.0"
+description = "AI-powered QA testing agent backend"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.12",
+    "python-docx>=1.1.2",
+    "pillow>=10.0.0",
+    "pyyaml>=6.0.2",
+    "litellm>=1.50.0",
+    "mcp[cli]>=1.9.0",
+    "playwright>=1.49.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "aiofiles>=24.1.0",
+    "loguru>=0.7.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.28.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
