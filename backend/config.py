@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     anthropic_api_key: str = ""
 
+    # LLM Provider: "direct" (use API keys) or "copilot_proxy" (use vscode-lm-proxy)
+    llm_provider: str = "direct"
+    copilot_proxy_url: str = "http://localhost:4000/v1"
+    copilot_proxy_model: str = ""  # Override model name sent to proxy (empty = use default)
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
@@ -35,3 +40,10 @@ if settings.openai_api_key:
     os.environ.setdefault("OPENAI_API_KEY", settings.openai_api_key)
 if settings.anthropic_api_key:
     os.environ.setdefault("ANTHROPIC_API_KEY", settings.anthropic_api_key)
+
+# Propagate LLM provider settings so llm_client.py can read them
+os.environ.setdefault("LLM_PROVIDER", settings.llm_provider)
+if settings.copilot_proxy_url:
+    os.environ.setdefault("COPILOT_PROXY_URL", settings.copilot_proxy_url)
+if settings.copilot_proxy_model:
+    os.environ.setdefault("COPILOT_PROXY_MODEL", settings.copilot_proxy_model)

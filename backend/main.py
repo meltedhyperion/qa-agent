@@ -34,7 +34,8 @@ app.include_router(ws_router)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    from core.llm_client import get_active_provider_info
+    return {"status": "ok", "llm": get_active_provider_info()}
 
 
 if __name__ == "__main__":

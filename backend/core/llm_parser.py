@@ -152,7 +152,7 @@ async def parse_document_with_llm(
         model: LiteLLM model identifier.
         parsing_hint: Optional user guidance on where/how to find test cases.
     """
-    from litellm import acompletion
+    from core.llm_client import acompletion
 
     # Extract raw content from the document
     content = extract_document_content(file_path)
@@ -253,7 +253,7 @@ async def parse_config_with_llm(
         file_path: Path to the YAML file.
         model: LiteLLM model identifier.
     """
-    from litellm import acompletion
+    from core.llm_client import acompletion
 
     path = Path(file_path)
     if not path.exists():

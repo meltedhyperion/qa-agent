@@ -6,6 +6,9 @@ import base64
 import os
 import time
 from dataclasses import dataclass, field
+from io import BytesIO
+
+from PIL import Image, ImageDraw, ImageFont
 
 from playwright.async_api import (
     Browser,
@@ -266,6 +269,9 @@ async def capture_screenshot(
     else:
         screenshot_bytes = await page.screenshot(**ss_kwargs)
 
+    # Overlay URL bar onto the screenshot
+    screenshot_bytes = _overlay_url_bar(screenshot_bytes, page.url)
+
     # Save to disk
     filepath = ""
     if state.screenshot_dir:
@@ -287,6 +293,69 @@ async def capture_screenshot(
         "success": True,
         "error": None,
     }
+
+
+def _overlay_url_bar(screenshot_bytes: bytes, url: str) -> bytes:
+    """Composite a URL address bar onto the top of a screenshot image."""
+    img = Image.open(BytesIO(screenshot_bytes))
+    img_w, img_h = img.size
+
+    bar_height = 32
+    padding_x = 12
+
+    # Create new image with space for the bar
+    composite = Image.new("RGB", (img_w, img_h + bar_height), color=(240, 240, 240))
+
+    # Draw the address bar background
+    draw = ImageDraw.Draw(composite)
+    draw.rectangle([0, 0, img_w, bar_height], fill=(240, 240, 240))
+
+    # Rounded URL field background
+    field_margin = 6
+    field_y0 = field_margin
+    field_y1 = bar_height - field_margin
+    field_x0 = padding_x
+    field_x1 = img_w - padding_x
+    draw.rounded_rectangle(
+        [field_x0, field_y0, field_x1, field_y1],
+        radius=8,
+        fill=(255, 255, 255),
+        outline=(200, 200, 200),
+    )
+
+    # Draw URL text
+    try:
+        font = ImageFont.truetype("Arial", 13)
+    except OSError:
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 13)
+        except OSError:
+            font = ImageFont.load_default()
+
+    # Truncate URL if too wide
+    max_text_width = field_x1 - field_x0 - 16
+    display_url = url
+    bbox = draw.textbbox((0, 0), display_url, font=font)
+    if bbox[2] - bbox[0] > max_text_width:
+        while len(display_url) > 10:
+            display_url = display_url[:-1]
+            bbox = draw.textbbox((0, 0), display_url + "…", font=font)
+            if bbox[2] - bbox[0] <= max_text_width:
+                display_url += "…"
+                break
+
+    text_y = field_y0 + (field_y1 - field_y0 - (bbox[3] - bbox[1])) // 2
+    draw.text((field_x0 + 8, text_y), display_url, fill=(51, 51, 51), font=font)
+
+    # Separator line
+    draw.line([(0, bar_height - 1), (img_w, bar_height - 1)], fill=(210, 210, 210))
+
+    # Paste original screenshot below the bar
+    composite.paste(img, (0, bar_height))
+
+    buf = BytesIO()
+    composite.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 async def _get_accessibility_snapshot(page: Page) -> str:

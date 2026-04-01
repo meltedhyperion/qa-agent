@@ -45,7 +45,7 @@ async def execute_test_case(
     Returns:
         TestResult with pass/fail status, step results, and summary.
     """
-    from litellm import acompletion
+    from core.llm_client import acompletion
 
     start_time = time.time()
     test_id = test_case.get("id", "unknown")
